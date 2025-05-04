@@ -48,4 +48,4 @@
   - Parameter initialization
 
 # Data Flow
-<img width="748" alt="image" src="https://github.com/user-attachments/assets/3bfbaab4-796a-446f-82a2-3c37e87083ff" />
+<img width="556" alt="image" src="https://github.com/user-attachments/assets/8dd2e665-fec5-4f4f-9773-5a50799dcb2f" />
