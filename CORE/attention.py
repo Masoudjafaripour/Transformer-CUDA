@@ -1,102 +1,120 @@
-from .ops import matmul_kernel, softmax_kernel
 import numpy as np
-import math
 from numba import cuda
+import math
 
-def attention(q, k, v, mask=None):
-    """Scaled dot-product attention"""
-    d_k = q.shape[-1]
-    scores = matmul(q, k.T) / math.sqrt(d_k)
-    
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    
-    attn = softmax(scores)
-    return matmul(attn, v), attn
+class CUDAAttention:
+    def __init__(self):
+        self.TILE_SIZE = 16
+        self.THREADS_PER_BLOCK = 32
 
-def gpu_matmul(A, B):
-    """GPU-accelerated matrix multiplication"""
-    m, k = A.shape
-    k2, n = B.shape
-    if k != k2:
-        raise ValueError(f"Incompatible shapes: {A.shape}, {B.shape}")
+    @staticmethod
+    @cuda.jit
+    def _matmul_kernel(A, B, C):
+        """CUDA kernel for matrix multiplication"""
+        row, col = cuda.grid(2)
+        if row < C.shape[0] and col < C.shape[1]:
+            tmp = 0.0
+            for i in range(A.shape[1]):
+                tmp += A[row, i] * B[i, col]
+            C[row, col] = tmp
 
-    A = A.astype(np.float32)
-    B = B.astype(np.float32)
-    
-    # Copy matrices to GPU
-    dA = cuda.to_device(A)
-    dB = cuda.to_device(B)
-    dC = cuda.device_array((m, n), dtype=np.float32)
+    @staticmethod
+    @cuda.jit
+    def _softmax_kernel(scores, result, seq_length):
+        """CUDA kernel for softmax operation"""
+        row = cuda.grid(1)
+        if row < seq_length:
+            # Find max for numerical stability
+            max_val = -float('inf')
+            for i in range(seq_length):
+                max_val = max(max_val, scores[row, i])
 
-    # Configure CUDA grid
-    TILE_SIZE = 16
-    threads_per_block = (TILE_SIZE, TILE_SIZE)
-    blocks_per_grid_x = (n + TILE_SIZE - 1) // TILE_SIZE
-    blocks_per_grid_y = (m + TILE_SIZE - 1) // TILE_SIZE
-    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+            # Compute exp and sum
+            sum_exp = 0.0
+            for i in range(seq_length):
+                val = math.exp(scores[row, i] - max_val)
+                result[row, i] = val
+                sum_exp += val
 
-    # Launch kernel
-    matmul_kernel[blocks_per_grid, threads_per_block](dA, dB, dC)
-    return dC.copy_to_host()
+            # Normalize
+            for i in range(seq_length):
+                result[row, i] /= sum_exp
 
-def self_attention_cuda(X, W_Q, W_K, W_V):
-    """CUDA-accelerated self-attention computation"""
-    seq_length, d_model = X.shape
-    d_k = W_Q.shape[1]
-    d_v = W_V.shape[1]
+    def matrix_multiply(self, A, B):
+        """GPU-accelerated matrix multiplication"""
+        m, k = A.shape
+        k2, n = B.shape
+        if k != k2:
+            raise ValueError(f"Matrix dimensions incompatible: {A.shape}, {B.shape}")
 
-    # Compute Q, K, V on GPU
-    Q = gpu_matmul(X, W_Q)  # (seq_len, d_k)
-    K = gpu_matmul(X, W_K)  # (seq_len, d_k)
-    V = gpu_matmul(X, W_V)  # (seq_len, d_v)
+        # Prepare data
+        A = A.astype(np.float32)
+        B = B.astype(np.float32)
+        dA = cuda.to_device(A)
+        dB = cuda.to_device(B)
+        dC = cuda.device_array((m, n), dtype=np.float32)
 
-    # Compute attention scores
-    K_T = K.T.astype(np.float32)
-    scores = gpu_matmul(Q, K_T) / math.sqrt(d_k)
+        # Configure grid
+        threads = (self.TILE_SIZE, self.TILE_SIZE)
+        blocks_x = (n + self.TILE_SIZE - 1) // self.TILE_SIZE
+        blocks_y = (m + self.TILE_SIZE - 1) // self.TILE_SIZE
+        blocks = (blocks_x, blocks_y)
 
-    # Apply softmax on GPU
-    attention_weights = np.zeros((seq_length, seq_length), dtype=np.float32)
-    d_scores = cuda.to_device(scores)
-    d_attention_weights = cuda.to_device(attention_weights)
+        # Execute kernel
+        self._matmul_kernel[blocks, threads](dA, dB, dC)
+        return dC.copy_to_host()
 
-    threads_per_block = 32
-    blocks_per_grid = (seq_length + threads_per_block - 1) // threads_per_block
-    softmax_kernel[blocks_per_grid, threads_per_block](d_scores, d_attention_weights, seq_length)
-    attention_weights = d_attention_weights.copy_to_host()
+    def compute_attention(self, X, W_Q, W_K, W_V):
+        """Compute self-attention with CUDA acceleration"""
+        seq_length, d_model = X.shape
+        d_k = W_Q.shape[1]
+        d_v = W_V.shape[1]
 
-    # Compute output
-    output = gpu_matmul(attention_weights, V)
-    return output, attention_weights
+        # Compute Q, K, V matrices
+        Q = self.matrix_multiply(X, W_Q)
+        K = self.matrix_multiply(X, W_K)
+        V = self.matrix_multiply(X, W_V)
 
-def multi_head_attention(X, W_Q, W_K, W_V, W_O, num_heads):
-    """CUDA-accelerated multi-head attention"""
-    seq_length, d_model = X.shape
+        # Compute attention scores
+        K_T = K.T.astype(np.float32)
+        scores = self.matrix_multiply(Q, K_T) / math.sqrt(d_k)
 
-    # Calculate dimensions for each head
-    d_k = W_Q.shape[1] // num_heads
-    d_v = W_V.shape[1] // num_heads
+        # Apply softmax
+        attention_weights = np.zeros((seq_length, seq_length), dtype=np.float32)
+        d_scores = cuda.to_device(scores)
+        d_weights = cuda.to_device(attention_weights)
 
-    outputs = []
-    all_attention_weights = []
+        blocks = (seq_length + self.THREADS_PER_BLOCK - 1) // self.THREADS_PER_BLOCK
+        self._softmax_kernel[blocks, self.THREADS_PER_BLOCK](d_scores, d_weights, seq_length)
+        attention_weights = d_weights.copy_to_host()
 
-    # Process each attention head
-    for i in range(num_heads):
-        # Slice weights for this head
-        W_Q_i = W_Q[:, i*d_k:(i+1)*d_k]
-        W_K_i = W_K[:, i*d_k:(i+1)*d_k]
-        W_V_i = W_V[:, i*d_v:(i+1)*d_v]
+        # Compute final output
+        output = self.matrix_multiply(attention_weights, V)
+        return output, attention_weights
 
-        # Compute attention for this head
-        out_i, attn_i = self_attention_cuda(X, W_Q_i, W_K_i, W_V_i)
-        
-        outputs.append(out_i)
-        all_attention_weights.append(attn_i)
+    def multi_head_attention(self, X, W_Q, W_K, W_V, W_O, num_heads):
+        """Compute multi-head attention with CUDA acceleration"""
+        seq_length, d_model = X.shape
+        d_k = W_Q.shape[1] // num_heads
+        d_v = W_V.shape[1] // num_heads
 
-    # Concatenate all heads
-    concat = np.concatenate(outputs, axis=-1).astype(np.float32)
+        outputs = []
+        attention_weights = []
 
-    # Final linear projection
-    final_output = gpu_matmul(concat, W_O)
+        # Process each attention head
+        for i in range(num_heads):
+            # Extract weights for this head
+            W_Q_i = W_Q[:, i*d_k:(i+1)*d_k]
+            W_K_i = W_K[:, i*d_k:(i+1)*d_k]
+            W_V_i = W_V[:, i*d_v:(i+1)*d_v]
 
-    return final_output, all_attention_weights
+            # Compute attention for this head
+            out_i, attn_i = self.compute_attention(X, W_Q_i, W_K_i, W_V_i)
+            outputs.append(out_i)
+            attention_weights.append(attn_i)
+
+        # Combine heads
+        concat = np.concatenate(outputs, axis=-1).astype(np.float32)
+        final_output = self.matrix_multiply(concat, W_O)
+
+        return final_output, attention_weights

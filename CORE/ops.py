@@ -1,6 +1,32 @@
 import numpy as np
-from numba import cuda, float32
+from numba import cuda
 import math
+
+def gpu_matmul(A, B):
+    """GPU-accelerated matrix multiplication"""
+    m, k = A.shape
+    k2, n = B.shape
+    if k != k2:
+        raise ValueError(f"Incompatible shapes: {A.shape}, {B.shape}")
+
+    A = A.astype(np.float32)
+    B = B.astype(np.float32)
+    
+    # Copy matrices to GPU
+    dA = cuda.to_device(A)
+    dB = cuda.to_device(B)
+    dC = cuda.device_array((m, n), dtype=np.float32)
+
+    # Configure CUDA grid
+    TILE_SIZE = 16
+    threads_per_block = (TILE_SIZE, TILE_SIZE)
+    blocks_per_grid_x = (n + TILE_SIZE - 1) // TILE_SIZE
+    blocks_per_grid_y = (m + TILE_SIZE - 1) // TILE_SIZE
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+
+    # Launch kernel
+    matmul_kernel[blocks_per_grid, threads_per_block](dA, dB, dC)
+    return dC.copy_to_host()
 
 @cuda.jit
 def matmul_kernel(A, B, C):
